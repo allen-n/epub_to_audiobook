@@ -1,9 +1,7 @@
-from concurrent.futures import ThreadPoolExecutor
 import os
 import asyncio
-from multiprocessing import cpu_count
 import logging
-from typing import Optional, Union, List, Tuple
+from typing import Union, List, Tuple
 
 from pydub import AudioSegment
 from wyoming.client import AsyncTcpClient
@@ -55,32 +53,25 @@ class PiperCommWithPauses:
         silent = AudioSegment.silent(duration=duration_ms)
         return silent
 
-    def synthesize(self, text: str) -> Tuple[bytes, int, int, int]:
+    async def synthesize(self, text: str) -> Tuple[bytes, int, int, int]:
         """Sends a synthesis request to the Piper TTS server and returns the audio data and metadata."""
         logger.debug(f"Synthesizing text: {text[:50]}...")
 
-        async def run():
-            return await synthesize_speech(text, host=self.host, port=self.port)
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            audio_data, sample_rate, sample_width, channels = loop.run_until_complete(
-                run()
-            )
-        finally:
-            loop.close()
-            asyncio.set_event_loop(None)
-        if audio_data is None:
-            audio_data = b""
+        audio_data, sample_rate, sample_width, channels = await synthesize_speech(
+            text, host=self.host, port=self.port
+        )
+        if not audio_data:
+            logger.error("No audio data received")
+            return b"", 0, 0, 0
         return audio_data, sample_rate, sample_width, channels
 
-    def synthesize_and_convert(
+    async def synthesize_and_convert(
         self, idx_text: Tuple[int, str]
     ) -> Tuple[int, AudioSegment]:
-        """Synthesizes text and returns a tuple of index and AudioSegment."""
+        """Asynchronously synthesizes text and returns a tuple of index and AudioSegment."""
         idx, text = idx_text
-        audio_data, rate, width, channels = self.synthesize(text)
+        logger.debug(f"Synthesizing text at index {idx}, length:{(len(text))}...")
+        audio_data, rate, width, channels = await self.synthesize(text)
         # Ensure sample_width is in bytes per sample
         if width > 4:  # Assume width is in bits
             width = width // 8
@@ -93,39 +84,36 @@ class PiperCommWithPauses:
         )
         return idx, audio_segment
 
-    def chunkify(self) -> AudioSegment:
-        num_workers = min(cpu_count(), len(self.parsed))
-        logger.debug(f"Starting chunkify process with {num_workers} workers")
-        audio_segments = []
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            # Prepare the list of texts with their indices
-            indexed_texts = list(enumerate(self.parsed))
-            # Submit tasks and maintain the order via indices
-            futures = {
-                executor.submit(self.synthesize_and_convert, idx_text): idx_text[0]
-                for idx_text in indexed_texts
-            }
-            # Collect results and store them in a dictionary
-            results = {}
-            for future in futures:
-                idx = futures[future]
-                try:
-                    idx, audio_segment = future.result()
-                    results[idx] = audio_segment
-                except Exception as e:
-                    logger.error(f"An error occurred during synthesis: {e}")
+    async def chunkify(self) -> AudioSegment:
+        logger.debug("Starting chunkify process")
+        # Prepare the list of texts with their indices
+        indexed_texts = list(enumerate(self.parsed))
+        tasks = [self.synthesize_and_convert(idx_text) for idx_text in indexed_texts]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Reconstruct the audio segments in order
-            for idx in range(len(self.parsed)):
-                audio_segment = results.get(idx)
-                if audio_segment:
-                    audio_segments.append(audio_segment)
-                    if idx < len(self.parsed) - 1 and self.break_duration > 0:
-                        # Insert pause
-                        pause_segment = self.generate_pause(self.break_duration)
-                        audio_segments.append(pause_segment)
-                else:
-                    logger.error(f"Missing audio segment at index {idx}")
+        audio_segments = []
+        # Collect results and reconstruct the audio segments in order
+        results_dict = {}
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"An error occurred during synthesis: {result}")
+                continue
+            if not isinstance(result, tuple):
+                logger.error(f"Unexpected result: {result}")
+                continue
+            idx, audio_segment = result
+            results_dict[idx] = audio_segment
+
+        for idx in range(len(self.parsed)):
+            audio_segment = results_dict.get(idx)
+            if audio_segment:
+                audio_segments.append(audio_segment)
+                if idx < len(self.parsed) - 1 and self.break_duration > 0:
+                    # Insert pause
+                    pause_segment = self.generate_pause(self.break_duration)
+                    audio_segments.append(pause_segment)
+            else:
+                logger.error(f"Missing audio segment at index {idx}")
 
         # Stitch the audio segments together
         combined = sum(audio_segments, AudioSegment.empty())
@@ -133,7 +121,7 @@ class PiperCommWithPauses:
         return combined
 
     def save(self, audio_fname: Union[str, bytes]) -> None:
-        combined = self.chunkify()
+        combined = asyncio.run(self.chunkify())
         # Export the combined audio to the desired format
         combined.export(audio_fname, format=self.output_format)
         logger.info(f"Audio saved to: {audio_fname}")
