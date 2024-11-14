@@ -17,7 +17,7 @@ services:
       - PUID=1000
       - PGID=1000
       - TZ=Etc/UTC
-      - PIPER_VOICE=en_GB-northern_english_male-medium
+      - PIPER_VOICE=en_US-hfc_male-medium
       - PIPER_LENGTH=1.0 # optional
       - PIPER_NOISE=0.667 # optional
       - PIPER_NOISEW=0.333 # optional
