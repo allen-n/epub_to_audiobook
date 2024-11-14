@@ -1,7 +1,10 @@
+from math import e
 import os
 import asyncio
 import logging
-from typing import Union, List, Tuple
+import timeit
+from typing import Optional, Union, List, Tuple
+
 
 from pydub import AudioSegment
 from wyoming.client import AsyncTcpClient
@@ -32,6 +35,7 @@ class PiperCommWithPauses:
         self.break_string = break_string
         self.break_duration = int(break_duration)
         self.output_format = output_format
+        self.client: Optional[AsyncTcpClient] = None
 
         self.parsed = self.parse_text()
 
@@ -44,8 +48,12 @@ class PiperCommWithPauses:
             return [self.full_text]
 
         parts = self.full_text.split(self.break_string)
-        logger.debug(f"Split into {len(parts)} parts")
-        return parts
+        parts = [part for part in parts if part.strip() != ""]
+        new_parts = [
+            self.break_string.join(parts[i : i + 10]) for i in range(0, len(parts), 10)
+        ]
+        logger.debug(f"Split into {len(new_parts)} parts")
+        return new_parts
 
     def generate_pause(self, duration_ms: int) -> AudioSegment:
         logger.debug(f"Generating pause of {duration_ms} ms")
@@ -53,11 +61,16 @@ class PiperCommWithPauses:
         silent = AudioSegment.silent(duration=duration_ms)
         return silent
 
+    async def synthesize_and_convert_with_semaphore(
+        self, idx_text: Tuple[int, str], sem: asyncio.Semaphore
+    ) -> Tuple[int, AudioSegment]:
+        async with sem:
+            return await self.synthesize_and_convert(idx_text)
+
     async def synthesize(self, text: str) -> Tuple[bytes, int, int, int]:
         """Sends a synthesis request to the Piper TTS server and returns the audio data and metadata."""
-        logger.debug(f"Synthesizing text: {text[:50]}...")
 
-        audio_data, sample_rate, sample_width, channels = await synthesize_speech(
+        audio_data, sample_rate, sample_width, channels = await self.synthesize_speech(
             text, host=self.host, port=self.port
         )
         if not audio_data:
@@ -70,8 +83,9 @@ class PiperCommWithPauses:
     ) -> Tuple[int, AudioSegment]:
         """Asynchronously synthesizes text and returns a tuple of index and AudioSegment."""
         idx, text = idx_text
-        logger.debug(f"Synthesizing text at index {idx}, length:{(len(text))}...")
         audio_data, rate, width, channels = await self.synthesize(text)
+        if audio_data == b"":
+            raise ValueError("No audio data received")
         # Ensure sample_width is in bytes per sample
         if width > 4:  # Assume width is in bits
             width = width // 8
@@ -85,11 +99,42 @@ class PiperCommWithPauses:
         return idx, audio_segment
 
     async def chunkify(self) -> AudioSegment:
+        """Old perf: 11x realtime
+
+        Returns:
+            AudioSegment: _description_
+        """
         logger.debug("Starting chunkify process")
         # Prepare the list of texts with their indices
+
         indexed_texts = list(enumerate(self.parsed))
-        tasks = [self.synthesize_and_convert(idx_text) for idx_text in indexed_texts]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        max_concurrent_tasks = 5
+        sem = asyncio.Semaphore(max_concurrent_tasks)
+
+        tasks = [
+            self.synthesize_and_convert_with_semaphore(idx_text, sem)
+            for idx_text in indexed_texts
+        ]
+
+        results = []
+        start = timeit.default_timer()
+        for task in asyncio.as_completed(tasks):
+            result = await task
+            results.append(result)
+            now = timeit.default_timer()
+            elapsed = now - start
+            total_seconds_remaining = (len(tasks) - len(results)) * (
+                elapsed / max(1, len(results))
+            )
+            estimated_remaining_time_m = total_seconds_remaining // 60
+            estimated_remaining_time_s = total_seconds_remaining % 60
+            print(
+                f"Processed {len(results)} of {len(tasks)} chunks in chapter. Estimated time remaining for chapter: {round(estimated_remaining_time_m)} min, {round(estimated_remaining_time_s)} sec",
+                end="\r",
+                flush=True,
+            )
+
+        # results = await asyncio.gather(*tasks, return_exceptions=True)
 
         audio_segments = []
         # Collect results and reconstruct the audio segments in order
@@ -126,37 +171,42 @@ class PiperCommWithPauses:
         combined.export(audio_fname, format=self.output_format)
         logger.info(f"Audio saved to: {audio_fname}")
 
+    def get_client(self, host: str, port: int) -> AsyncTcpClient:
+        # if not self.client:
+        #     self.client = AsyncTcpClient(host, port)
+        # return self.client
+        return AsyncTcpClient(host, port)
 
-async def synthesize_speech(text, host="localhost", port=10200):
-    client = AsyncTcpClient(host, port)
-    synthesize = Synthesize(text=text)
-    request_event = synthesize.event()
+    async def synthesize_speech(self, text: str, host: str, port: int):
+        client = self.get_client(host, port)
+        synthesize = Synthesize(text=text)
+        request_event = synthesize.event()
 
-    audio_data = bytearray()
-    sample_rate = 22050  # Default sample rate
-    sample_width = 2  # Default to 16-bit audio
-    channels = 1  # Default to mono
+        audio_data = bytearray()
+        sample_rate = 22050  # Default sample rate
+        sample_width = 2  # Default to 16-bit audio
+        channels = 1  # Default to mono
 
-    async with client:
-        await client.write_event(request_event)
+        async with client:
+            await client.write_event(request_event)
 
-        while True:
-            response_event = await client.read_event()
-            if response_event is None:
-                break
+            while True:
+                response_event = await client.read_event()
+                if response_event is None:
+                    break
 
-            if response_event.type == "audio-start":
-                # Extract audio metadata if available
-                sample_rate = response_event.data.get("rate", sample_rate)
-                sample_width = response_event.data.get("width", sample_width)
-                channels = response_event.data.get("channels", channels)
-            elif response_event.type == "audio-chunk" and response_event.payload:
-                audio_data.extend(response_event.payload)
-            elif response_event.type == "audio-stop":
-                return bytes(audio_data), sample_rate, sample_width, channels
-            else:
-                raise ValueError(f"Unexpected event type: {response_event.type}")
-    return None, sample_rate, sample_width, channels
+                if response_event.type == "audio-start":
+                    # Extract audio metadata if available
+                    sample_rate = response_event.data.get("rate", sample_rate)
+                    sample_width = response_event.data.get("width", sample_width)
+                    channels = response_event.data.get("channels", channels)
+                elif response_event.type == "audio-chunk" and response_event.payload:
+                    audio_data.extend(response_event.payload)
+                elif response_event.type == "audio-stop":
+                    return bytes(audio_data), sample_rate, sample_width, channels
+                else:
+                    raise ValueError(f"Unexpected event type: {response_event.type}")
+        return None, sample_rate, sample_width, channels
 
 
 class PiperDockerTTSProvider(BaseTTSProvider):
@@ -196,7 +246,7 @@ class PiperDockerTTSProvider(BaseTTSProvider):
         return 0  # Piper is free
 
     def get_break_string(self):
-        return "    "  # Four spaces as the default break string
+        return "."  # Four spaces as the default break string
 
     def get_output_file_extension(self):
         return self.config.output_format
